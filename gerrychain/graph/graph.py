@@ -13,17 +13,24 @@ imported as required.
 
 import functools
 import json
-from typing import Any
 import warnings
+from typing import Any, List, Iterable, Optional, Set, Tuple, Union
 
-import networkx
-from networkx.classes.function import frozen
-from networkx.readwrite import json_graph
+from shapely import hausdorff_distance
+from networkx.classes.function import frozen, freeze
+from networkx import (
+    Graph as nxGraph,
+    get_node_attributes,
+    set_node_attributes,
+    line_graph,
+    json_graph,
+    cycle_basis
+)
 import pandas as pd
 
 from .adjacency import neighbors
 from .geo import GeometryError, invalid_geometries, reprojected
-from typing import List, Iterable, Optional, Set, Tuple, Union
+from .weights import shared
 
 
 def json_serialize(input_object: Any) -> Optional[int]:
@@ -48,9 +55,9 @@ def json_serialize(input_object: Any) -> Optional[int]:
     return None
 
 
-class Graph(networkx.Graph):
+class Graph(nxGraph):
     """
-    Represents a graph to be partitioned, extending the :class:`networkx.Graph`.
+    Represents a graph to be partitioned, extending the :class:`nxGraph`.
 
     This class includes additional class methods for constructing graphs from shapefiles,
     and for saving and loading graphs in JSON format.
@@ -60,12 +67,12 @@ class Graph(networkx.Graph):
         return "<Graph [{} nodes, {} edges]>".format(len(self.nodes), len(self.edges))
 
     @classmethod
-    def from_networkx(cls, graph: networkx.Graph) -> "Graph":
+    def from_networkx(cls, graph: nxGraph) -> "Graph":
         """
-        Create a Graph instance from a networkx.Graph object.
+        Create a Graph instance from a nxGraph object.
 
         :param graph: The networkx graph to be converted.
-        :type graph: networkx.Graph
+        :type graph: nxGraph
 
         :returns: The converted graph as an instance of this class.
         :rtype: Graph
@@ -126,6 +133,8 @@ class Graph(networkx.Graph):
         cols_to_add: Optional[List[str]] = None,
         reproject: bool = False,
         ignore_errors: bool = False,
+        edgeweighting: bool=False,
+        edgeweighting_function: callable=hausdorff_distance
     ) -> "Graph":
         """
         Create a :class:`Graph` from a shapefile (or GeoPackage, or GeoJSON, or
@@ -170,6 +179,8 @@ class Graph(networkx.Graph):
             cols_to_add=cols_to_add,
             reproject=reproject,
             ignore_errors=ignore_errors,
+            edgeweighting=edgeweighting,
+            edgeweighting_function=edgeweighting_function
         )
         graph.graph["crs"] = df.crs.to_json()
         return graph
@@ -183,6 +194,8 @@ class Graph(networkx.Graph):
         reproject: bool = False,
         ignore_errors: bool = False,
         crs_override: Optional[Union[str, int]] = None,
+        edgeweighting: bool=False,
+        edgeweighting_function: callable=hausdorff_distance
     ) -> "Graph":
         """
         Creates the adjacency :class:`Graph` of geometries described by `dataframe`.
@@ -255,6 +268,13 @@ class Graph(networkx.Graph):
         adjacencies = neighbors(df, adjacency)
         graph = cls(adjacencies)
 
+        # Add edge weights.
+        if edgeweighting_function or edgeweighting:
+            geometries = df.geometry
+
+            for (u,v) in graph.edges():
+                graph[u][v]["weight"] = edgeweighting_function(geometries[u], geometries[v])
+
         graph.geometry = df.geometry
 
         graph.issue_warnings()
@@ -264,7 +284,7 @@ class Graph(networkx.Graph):
 
         # Add area data to the nodes
         areas = df.geometry.area.to_dict()
-        networkx.set_node_attributes(graph, name="area", values=areas)
+        set_node_attributes(graph, name="area", values=areas)
 
         graph.add_data(df, columns=cols_to_add)
 
@@ -305,6 +325,9 @@ class Graph(networkx.Graph):
     @property
     def edge_indices(self):
         return set(self.edges)
+    
+    def basis(self) -> List: return cycle_basis(self)
+    def linegraph(self, weighting=shared) -> nxGraph: return weighting(self, line_graph(self))
 
     def add_data(
         self, df: pd.DataFrame, columns: Optional[Iterable[str]] = None
@@ -327,7 +350,7 @@ class Graph(networkx.Graph):
         check_dataframe(df[columns])
 
         column_dictionaries = df.to_dict("index")
-        networkx.set_node_attributes(self, column_dictionaries)
+        set_node_attributes(self, column_dictionaries)
 
         if hasattr(self, "data"):
             self.data[columns] = df[columns]  # type: ignore
@@ -372,7 +395,7 @@ class Graph(networkx.Graph):
         column_dictionaries = df.to_dict()
 
         if left_index is not None:
-            ids_to_index = networkx.get_node_attributes(self, left_index)
+            ids_to_index = get_node_attributes(self, left_index)
         else:
             # When the left_index is node ID, the matching is just
             # a redundant {node: node} dictionary
@@ -385,7 +408,7 @@ class Graph(networkx.Graph):
             for node_id, index in ids_to_index.items()
         }
 
-        networkx.set_node_attributes(self, node_attributes)
+        set_node_attributes(self, node_attributes)
 
     @property
     def islands(self) -> Set:
@@ -444,6 +467,9 @@ def add_boundary_perimeters(graph: Graph, geometries: pd.Series) -> None:
             )
             boundary_perimeter = total_perimeter - shared_perimeter
             graph.nodes[node]["boundary_perim"] = boundary_perimeter
+    
+    for (u, v) in graph.edges():
+        graph[u][v]["boundary_edge"] = boundary_nodes[u] and boundary_nodes[v]
 
 
 def check_dataframe(df: pd.DataFrame) -> None:
@@ -457,7 +483,7 @@ def check_dataframe(df: pd.DataFrame) -> None:
             warnings.warn("NA values found in column {}!".format(column))
 
 
-def remove_geometries(data: networkx.Graph) -> None:
+def remove_geometries(data: nxGraph) -> None:
     """
     Remove geometry attributes from NetworkX adjacency data object,
     because they are not serializable. Mutates the ``data`` object.
@@ -466,7 +492,7 @@ def remove_geometries(data: networkx.Graph) -> None:
 
     :param data: an adjacency data object (returned by
         :func:`networkx.readwrite.json_graph.adjacency_data`)
-    :type data: networkx.Graph
+    :type data: nxGraph
 
     :returns: None
     """
@@ -481,7 +507,7 @@ def remove_geometries(data: networkx.Graph) -> None:
             del node[key]
 
 
-def convert_geometries_to_geojson(data: networkx.Graph) -> None:
+def convert_geometries_to_geojson(data: nxGraph) -> None:
     """
     Convert geometry attributes in a NetworkX adjacency data object
     to GeoJSON, so that they can be serialized. Mutates the ``data`` object.
@@ -490,7 +516,7 @@ def convert_geometries_to_geojson(data: networkx.Graph) -> None:
 
     :param data: an adjacency data object (returned by
         :func:`networkx.readwrite.json_graph.adjacency_data`)
-    :type data: networkx.Graph
+    :type data: nxGraph
 
     :returns: None
     """
@@ -510,7 +536,7 @@ class FrozenGraph:
     Represents an immutable graph to be partitioned. It is based off :class:`Graph`.
 
     This speeds up chain runs and prevents having to deal with cache invalidation issues.
-    This class behaves slightly differently than :class:`Graph` or :class:`networkx.Graph`.
+    This class behaves slightly differently than :class:`Graph` or :class:`nxGraph`.
 
     Not intended to be a part of the public API.
 
@@ -535,7 +561,7 @@ class FrozenGraph:
 
         :returns: None
         """
-        self.graph = networkx.classes.function.freeze(graph)
+        self.graph = freeze(graph)
         self.graph.join = frozen
         self.graph.add_data = frozen
 
@@ -578,3 +604,4 @@ class FrozenGraph:
 
     def subgraph(self, nodes: Iterable[Any]) -> "FrozenGraph":
         return FrozenGraph(self.graph.subgraph(nodes))
+
